@@ -1,0 +1,591 @@
+-- allium: 1
+
+-- Redirect Matching Pipeline (Tenant-Scoped)
+-- Detailed specification for Matching.find_redirect and Matching.resolve_target,
+-- deferred from redirection.allium.
+--
+-- Describes: URL pattern evaluation, per-type match condition evaluation,
+-- priority ordering, and target URL resolution including regex substitution
+-- and query string handling.
+--
+-- Entry point: FindRedirect(tenant, request) — evaluates only the given
+-- tenant's active redirects. The caller (redirection.allium) is responsible
+-- for tenant resolution from the request hostname.
+
+use "./redirection.allium" as redir
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value UrlMatchResult {
+    matched: Boolean
+    captured_groups: List<String>
+}
+
+value ConditionEvaluation {
+    checked: Boolean
+    matched: Boolean
+}
+
+------------------------------------------------------------
+-- Rules: URL Pattern Matching
+------------------------------------------------------------
+
+-- A redirect's URL pattern matches a request when the normalised
+-- source path matches the normalised request path, subject to
+-- source flags. Normalisation and comparison happen in stages:
+-- path, then query string.
+
+rule UrlPatternMatchesLiteral {
+    when: EvaluateUrlPattern(redirect, request)
+
+    requires: not redirect.source_flags.is_regex
+
+    let source_path = extract_path(redirect.source_url)          -- black box
+    let request_path = extract_path(request.url)                 -- black box
+    let source_query = extract_query(redirect.source_url)        -- black box
+    let request_query = extract_query(request.url)               -- black box
+
+    -- Normalise paths
+    let norm_source = normalize_path(
+        source_path,
+        redirect.source_flags.case_insensitive,
+        redirect.source_flags.ignore_trailing_slash
+    )                                                            -- black box
+    let norm_request = normalize_path(
+        request_path,
+        redirect.source_flags.case_insensitive,
+        redirect.source_flags.ignore_trailing_slash
+    )                                                            -- black box
+
+    requires: norm_source = norm_request
+
+    -- Query string check depends on query handling mode
+    let query_matches =
+        if redirect.source_flags.query_handling = ignore:
+            true
+        else if redirect.source_flags.query_handling = exact:
+            source_query = request_query
+        else if redirect.source_flags.query_handling = exact_order:
+            source_query = request_query
+        else:
+            true    -- pass mode: query is forwarded, not matched
+
+    requires: query_matches
+
+    ensures: UrlPatternMatched(
+        redirect: redirect,
+        request: request,
+        result: UrlMatchResult { matched: true, captured_groups: [] }
+    )
+}
+
+rule UrlPatternMatchesRegex {
+    when: EvaluateUrlPattern(redirect, request)
+
+    requires: redirect.source_flags.is_regex
+
+    let result = regex_match(
+        redirect.source_url,
+        request.url,
+        redirect.source_flags.case_insensitive
+    )                                                            -- black box
+
+    requires: result.matched
+
+    ensures: UrlPatternMatched(
+        redirect: redirect,
+        request: request,
+        result: result
+    )
+}
+
+rule UrlPatternDoesNotMatch {
+    when: EvaluateUrlPattern(redirect, request)
+
+    requires:
+        if redirect.source_flags.is_regex:
+            not regex_match(redirect.source_url, request.url,
+                            redirect.source_flags.case_insensitive).matched
+        else:
+            normalize_path(extract_path(redirect.source_url),
+                           redirect.source_flags.case_insensitive,
+                           redirect.source_flags.ignore_trailing_slash)
+            != normalize_path(extract_path(request.url),
+                              redirect.source_flags.case_insensitive,
+                              redirect.source_flags.ignore_trailing_slash)
+
+    ensures: UrlPatternNotMatched(redirect: redirect, request: request)
+}
+
+------------------------------------------------------------
+-- Rules: Match Condition Evaluation
+------------------------------------------------------------
+
+-- After the URL pattern matches, the redirect's match_type
+-- determines an additional condition. For the url type no
+-- additional check is needed. For all others, the condition
+-- evaluates to matched or not-matched, which then determines
+-- which target URL is used.
+
+rule EvaluateConditionUrl {
+    when: UrlPatternMatched(redirect, request, result)
+
+    requires: redirect.match_type = url
+
+    ensures: ConditionEvaluated(
+        redirect: redirect,
+        request: request,
+        url_result: result,
+        condition: ConditionEvaluation { checked: false, matched: true }
+    )
+}
+
+rule EvaluateConditionIp {
+    when: UrlPatternMatched(redirect, request, result)
+
+    requires: redirect.match_type = ip
+
+    let ip_list = parse_ip_list(redirect.match_value)            -- black box
+    let matched = ip_in_list(request.client_ip, ip_list)         -- black box
+
+    ensures: ConditionEvaluated(
+        redirect: redirect,
+        request: request,
+        url_result: result,
+        condition: ConditionEvaluation { checked: true, matched: matched }
+    )
+}
+
+rule EvaluateConditionUserAgent {
+    when: UrlPatternMatched(redirect, request, result)
+
+    requires: redirect.match_type = user_agent
+
+    let matched =
+        if redirect.match_is_regex:
+            regex_test(redirect.match_value, request.user_agent ?? "")
+        else:
+            contains_insensitive(request.user_agent ?? "", redirect.match_value)
+
+    ensures: ConditionEvaluated(
+        redirect: redirect,
+        request: request,
+        url_result: result,
+        condition: ConditionEvaluation { checked: true, matched: matched }
+    )
+}
+
+rule EvaluateConditionReferrer {
+    when: UrlPatternMatched(redirect, request, result)
+
+    requires: redirect.match_type = referrer
+
+    let matched =
+        if redirect.match_is_regex:
+            regex_test(redirect.match_value, request.referrer ?? "")
+        else:
+            contains_insensitive(request.referrer ?? "", redirect.match_value)
+
+    ensures: ConditionEvaluated(
+        redirect: redirect,
+        request: request,
+        url_result: result,
+        condition: ConditionEvaluation { checked: true, matched: matched }
+    )
+}
+
+rule EvaluateConditionLoginStatus {
+    when: UrlPatternMatched(redirect, request, result)
+
+    requires: redirect.match_type = login_status
+
+    ensures: ConditionEvaluated(
+        redirect: redirect,
+        request: request,
+        url_result: result,
+        condition: ConditionEvaluation {
+            checked: true,
+            matched: request.is_authenticated
+        }
+    )
+}
+
+rule EvaluateConditionHeader {
+    when: UrlPatternMatched(redirect, request, result)
+
+    requires: redirect.match_type = header
+
+    let header_spec = parse_header_spec(redirect.match_value)    -- black box: {name, value}
+    let actual_value = get_header(request, header_spec.name)     -- black box
+
+    let matched =
+        if redirect.match_is_regex:
+            regex_test(header_spec.value, actual_value ?? "")
+        else:
+            actual_value = header_spec.value
+
+    ensures: ConditionEvaluated(
+        redirect: redirect,
+        request: request,
+        url_result: result,
+        condition: ConditionEvaluation { checked: true, matched: matched }
+    )
+}
+
+rule EvaluateConditionCookie {
+    when: UrlPatternMatched(redirect, request, result)
+
+    requires: redirect.match_type = cookie
+
+    let cookie_spec = parse_header_spec(redirect.match_value)    -- black box: {name, value}
+    let actual_value = get_cookie(request, cookie_spec.name)     -- black box
+
+    let matched =
+        if redirect.match_is_regex:
+            regex_test(cookie_spec.value, actual_value ?? "")
+        else:
+            actual_value = cookie_spec.value
+
+    ensures: ConditionEvaluated(
+        redirect: redirect,
+        request: request,
+        url_result: result,
+        condition: ConditionEvaluation { checked: true, matched: matched }
+    )
+}
+
+rule EvaluateConditionRole {
+    when: UrlPatternMatched(redirect, request, result)
+
+    requires: redirect.match_type = role
+
+    let matched = request.is_authenticated
+                  and request.user_role = redirect.match_value
+
+    ensures: ConditionEvaluated(
+        redirect: redirect,
+        request: request,
+        url_result: result,
+        condition: ConditionEvaluation { checked: true, matched: matched }
+    )
+}
+
+rule EvaluateConditionServerVariable {
+    when: UrlPatternMatched(redirect, request, result)
+
+    requires: redirect.match_type = server_variable
+
+    let var_spec = parse_header_spec(redirect.match_value)       -- black box: {name, value}
+    let actual_value = get_server_variable(request, var_spec.name)  -- black box
+
+    let matched = actual_value = var_spec.value
+
+    ensures: ConditionEvaluated(
+        redirect: redirect,
+        request: request,
+        url_result: result,
+        condition: ConditionEvaluation { checked: true, matched: matched }
+    )
+}
+
+rule EvaluateConditionLanguage {
+    when: UrlPatternMatched(redirect, request, result)
+
+    requires: redirect.match_type = language
+
+    let matched = locale_matches(
+        request.accept_language,
+        redirect.match_value
+    )                                                            -- black box
+
+    ensures: ConditionEvaluated(
+        redirect: redirect,
+        request: request,
+        url_result: result,
+        condition: ConditionEvaluation { checked: true, matched: matched }
+    )
+}
+
+------------------------------------------------------------
+-- Rules: Target Resolution
+------------------------------------------------------------
+
+-- After URL pattern and condition are evaluated, the target URL
+-- is resolved. Which target is selected depends on the match type
+-- and condition outcome.
+
+-- For url match: target_url is always the target.
+rule ResolveTargetUrl {
+    when: ConditionEvaluated(redirect, request, url_result, condition)
+
+    requires: redirect.match_type = url
+    requires: redirect.target_url != null
+
+    let raw_target = redirect.target_url
+
+    let substituted =
+        if redirect.source_flags.is_regex:
+            regex_substitute(raw_target, url_result.captured_groups)
+        else:
+            raw_target
+
+    let final_target = apply_query_handling(
+        substituted,
+        request.url,
+        redirect.source_flags.query_handling
+    )                                                            -- black box
+
+    ensures: TargetResolved(
+        redirect: redirect,
+        request: request,
+        target: final_target
+    )
+}
+
+-- For conditional match types (from/notfrom pattern):
+-- condition matched → target_url; not matched → alternate_target_url.
+rule ResolveTargetConditionalMatched {
+    when: ConditionEvaluated(redirect, request, url_result, condition)
+
+    requires: redirect.match_type in {ip, user_agent, referrer, header,
+              cookie, role, server_variable, language}
+    requires: condition.matched
+    requires: redirect.target_url != null
+
+    let raw_target = redirect.target_url
+
+    let substituted =
+        if redirect.source_flags.is_regex:
+            regex_substitute(raw_target, url_result.captured_groups)
+        else:
+            raw_target
+
+    let final_target = apply_query_handling(
+        substituted,
+        request.url,
+        redirect.source_flags.query_handling
+    )                                                            -- black box
+
+    ensures: TargetResolved(
+        redirect: redirect,
+        request: request,
+        target: final_target
+    )
+}
+
+rule ResolveTargetConditionalNotMatched {
+    when: ConditionEvaluated(redirect, request, url_result, condition)
+
+    requires: redirect.match_type in {ip, user_agent, referrer, header,
+              cookie, role, server_variable, language}
+    requires: not condition.matched
+    requires: redirect.alternate_target_url != null
+
+    let raw_target = redirect.alternate_target_url
+
+    let substituted =
+        if redirect.source_flags.is_regex:
+            regex_substitute(raw_target, url_result.captured_groups)
+        else:
+            raw_target
+
+    let final_target = apply_query_handling(
+        substituted,
+        request.url,
+        redirect.source_flags.query_handling
+    )                                                            -- black box
+
+    ensures: TargetResolved(
+        redirect: redirect,
+        request: request,
+        target: final_target
+    )
+}
+
+-- For login_status: authenticated → target_url; not → alternate_target_url.
+rule ResolveTargetLoginAuthenticated {
+    when: ConditionEvaluated(redirect, request, url_result, condition)
+
+    requires: redirect.match_type = login_status
+    requires: condition.matched    -- is_authenticated = true
+    requires: redirect.target_url != null
+
+    let raw_target = redirect.target_url
+
+    let substituted =
+        if redirect.source_flags.is_regex:
+            regex_substitute(raw_target, url_result.captured_groups)
+        else:
+            raw_target
+
+    let final_target = apply_query_handling(
+        substituted,
+        request.url,
+        redirect.source_flags.query_handling
+    )                                                            -- black box
+
+    ensures: TargetResolved(
+        redirect: redirect,
+        request: request,
+        target: final_target
+    )
+}
+
+rule ResolveTargetLoginUnauthenticated {
+    when: ConditionEvaluated(redirect, request, url_result, condition)
+
+    requires: redirect.match_type = login_status
+    requires: not condition.matched    -- is_authenticated = false
+    requires: redirect.alternate_target_url != null
+
+    let raw_target = redirect.alternate_target_url
+
+    let substituted =
+        if redirect.source_flags.is_regex:
+            regex_substitute(raw_target, url_result.captured_groups)
+        else:
+            raw_target
+
+    let final_target = apply_query_handling(
+        substituted,
+        request.url,
+        redirect.source_flags.query_handling
+    )                                                            -- black box
+
+    ensures: TargetResolved(
+        redirect: redirect,
+        request: request,
+        target: final_target
+    )
+}
+
+-- No target available: condition outcome has no corresponding target URL.
+rule ResolveTargetNone {
+    when: ConditionEvaluated(redirect, request, url_result, condition)
+
+    requires:
+        if redirect.match_type = url:
+            redirect.target_url = null
+        else if redirect.match_type = login_status:
+            if condition.matched: redirect.target_url = null
+            else: redirect.alternate_target_url = null
+        else:
+            if condition.matched: redirect.target_url = null
+            else: redirect.alternate_target_url = null
+
+    ensures: NoTargetAvailable(redirect: redirect, request: request)
+}
+
+------------------------------------------------------------
+-- Rules: Query String Handling
+------------------------------------------------------------
+
+-- apply_query_handling is a black box that modifies the target URL's
+-- query string based on the handling mode:
+--
+--   ignore:      Strip any query string from the target.
+--   exact:       Keep the target's own query string unchanged.
+--   pass:        Append the original request's query string to the target.
+--   exact_order: Like exact, but parameter order must match during
+--                matching (handled in URL pattern evaluation above).
+--                Target query string is unchanged.
+
+------------------------------------------------------------
+-- Rules: Regex Substitution
+------------------------------------------------------------
+
+-- regex_substitute is a black box that replaces capture group
+-- placeholders in the target URL with values captured during
+-- URL pattern matching.
+--
+-- Placeholders use $1, $2, ... notation. $1 is replaced by the
+-- first captured group, $2 by the second, and so on. If a
+-- placeholder references a group that was not captured, it is
+-- replaced with an empty string.
+
+------------------------------------------------------------
+-- Rules: Priority Ordering & First-Match Pipeline
+------------------------------------------------------------
+
+-- Redirects are evaluated in priority order. Priority is determined
+-- by two sort keys:
+--   1. Group position (ascending) — lower position = higher priority
+--   2. Redirect position within group (ascending)
+--
+-- The first redirect that produces a TargetResolved outcome wins.
+-- If a redirect produces NoTargetAvailable or UrlPatternNotMatched,
+-- evaluation continues with the next redirect in priority order.
+
+rule FindMatchingRedirect {
+    when: FindRedirect(tenant, request)
+
+    -- Collect active redirects for this tenant only
+    let candidates = Redirects where is_active and group.tenant = tenant
+
+    -- Evaluate each candidate in priority order.
+    -- first_match is a black box that:
+    --   1. Sorts candidates by (group.position asc, position asc)
+    --   2. For each candidate, triggers EvaluateUrlPattern
+    --   3. If URL matches, the condition evaluation chain fires
+    --   4. If TargetResolved is produced, returns that redirect + target
+    --   5. If NoTargetAvailable or UrlPatternNotMatched, continues to next
+    --   6. If no candidate produces a target, returns null
+    let match = first_match(candidates, request)                 -- black box
+
+    requires: match != null
+
+    ensures: RedirectFound(
+        tenant: tenant,
+        request: request,
+        redirect: match.redirect,
+        target: match.target
+    )
+}
+
+rule NoMatchFound {
+    when: FindRedirect(tenant, request)
+
+    let candidates = Redirects where is_active and group.tenant = tenant
+    let match = first_match(candidates, request)                 -- black box
+
+    requires: match = null
+
+    ensures: NoRedirectFound(tenant: tenant, request: request)
+}
+
+------------------------------------------------------------
+-- Black Box Functions Summary
+------------------------------------------------------------
+
+-- String / URL operations:
+--   extract_path(url) → String
+--   extract_query(url) → String?
+--   normalize_path(path, case_insensitive, ignore_trailing_slash) → String
+--   regex_match(pattern, subject, case_insensitive) → UrlMatchResult
+--   regex_test(pattern, subject) → Boolean
+--   regex_substitute(template, captured_groups) → String
+--   contains_insensitive(haystack, needle) → Boolean
+--   apply_query_handling(target_url, request_url, mode) → String
+--
+-- Request inspection:
+--   get_header(request, name) → String?
+--   get_cookie(request, name) → String?
+--   get_server_variable(request, name) → String?
+--
+-- Parsing:
+--   parse_ip_list(csv_string) → List<String>
+--   parse_header_spec(name_value_string) → { name: String, value: String }
+--
+-- Matching:
+--   ip_in_list(ip, list) → Boolean
+--   locale_matches(accept_language, target_locale) → Boolean
+--
+-- Pipeline:
+--   first_match(candidates, request) → { redirect: Redirect, target: String }?
+--
+-- Entry / exit triggers:
+--   FindRedirect(tenant, request) — entry point, called from redirection.allium
+--   RedirectFound(tenant, request, redirect, target) — emitted when a match is found
+--   NoRedirectFound(tenant, request) — emitted when no candidate matches

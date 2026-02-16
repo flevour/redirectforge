@@ -1,0 +1,1073 @@
+-- allium: 1
+
+-- Redirection: URL Redirect Management System (Multi-Tenant)
+-- Platform-agnostic behavioural specification for URL redirect management.
+-- Extracted from the Redirection WordPress plugin.
+--
+-- Multi-tenant: each Tenant owns a set of redirect rules applied across
+-- one or more hostnames. A request's hostname determines the tenant;
+-- the same rules govern all of a tenant's hosts (preview, production, etc.).
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum RedirectStatus { enabled | disabled }
+
+enum TenantStatus { active | suspended }
+
+enum QueryHandling { ignore | exact | pass | exact_order }
+
+enum MatchType {
+    url | ip | user_agent | referrer | login_status |
+    header | cookie | role | server_variable | language
+}
+
+enum ActionType { redirect | error | nothing | rewrite | random }
+
+enum IpLogging { full | anonymized | none }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value SourceFlags {
+    case_insensitive: Boolean
+    ignore_trailing_slash: Boolean
+    query_handling: QueryHandling
+    is_regex: Boolean
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- An inbound HTTP request. Managed by the web server / framework.
+-- ip is the raw connection IP. client_ip is resolved from proxy headers
+-- using config.ip_header_priority and config.trusted_proxy_ranges.
+external entity HttpRequest {
+    url: String
+    method: String
+    domain: String
+    ip: String
+    client_ip: String
+    user_agent: String?
+    referrer: String?
+    accept_language: String?
+    is_authenticated: Boolean
+    user_role: String?
+    response_code: Integer?
+}
+
+-- A piece of content whose public URL may change (e.g. a CMS post or page).
+external entity ContentItem {
+    content_type: String
+    current_url: String
+    previous_url: String?
+}
+
+external entity User { is_admin: Boolean }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Tenant {
+    name: String
+    status: TenantStatus
+
+    -- Relationships
+    hosts: TenantHost with tenant = this
+    groups: Group with tenant = this
+
+    -- Projections
+    active_hosts: hosts where status = enabled
+    active_groups: groups where status = enabled
+
+    -- Derived
+    is_active: status = active
+}
+
+entity TenantHost {
+    tenant: Tenant
+    hostname: String
+    environment: String?
+    status: RedirectStatus
+
+    -- Derived
+    is_active: status = enabled and tenant.is_active
+}
+
+entity Group {
+    tenant: Tenant
+    name: String
+    status: RedirectStatus
+    position: Integer
+
+    -- Relationships
+    redirects: Redirect with group = this
+
+    -- Projections
+    active_redirects: redirects where status = enabled
+
+    -- Derived
+    is_active: status = enabled and tenant.is_active
+}
+
+entity Redirect {
+    -- Organisation
+    group: Group
+    position: Integer
+    title: String?
+    status: RedirectStatus
+
+    -- Source URL pattern (path-based, not host-specific)
+    source_url: String
+    source_flags: SourceFlags
+
+    -- Match condition (beyond URL pattern)
+    match_type: MatchType
+    match_value: String?
+    match_is_regex: Boolean
+
+    -- Targets
+    -- For simple url match: target_url is the sole destination.
+    -- For conditional matches (ip, user_agent, referrer, header, cookie,
+    -- role, server_variable, language): target_url is the destination when
+    -- the condition matches; alternate_target_url when it does not.
+    -- For login_status match: target_url is the authenticated destination;
+    -- alternate_target_url is the unauthenticated destination.
+    target_url: String?
+    alternate_target_url: String?
+
+    -- Action
+    action_type: ActionType
+    action_code: Integer
+    random_targets: List<String>
+
+    -- Tracking
+    hit_count: Integer
+    last_hit_at: Timestamp?
+
+    -- Logging control
+    log_excluded: Boolean
+
+    -- Relationships
+    logs: RedirectLog with redirect = this
+
+    -- Derived
+    is_active: status = enabled and group.is_active
+    tenant: group.tenant
+}
+
+entity RedirectLog {
+    tenant: Tenant
+    redirect: Redirect?
+    created_at: Timestamp
+    source_url: String
+    target_url: String?
+    domain: String?
+    ip: String?
+    http_code: Integer
+    user_agent: String?
+    referrer: String?
+    request_method: String?
+    request_headers: String?
+    redirect_source: String?
+}
+
+entity NotFoundLog {
+    tenant: Tenant
+    created_at: Timestamp
+    url: String
+    domain: String?
+    ip: String?
+    user_agent: String?
+    referrer: String?
+    request_method: String?
+    request_headers: String?
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    redirect_log_retention_days: Integer = 0
+    not_found_log_retention_days: Integer = 0
+    track_hits: Boolean = true
+    log_request_headers: Boolean = false
+    ip_logging: IpLogging = full
+    ip_header_priority: List<String> = ["X-Forwarded-For"]
+    trusted_proxy_ranges: List<String> = []
+    log_cleanup_batch_size: Integer = 20_000
+    aggressive_cleanup_threshold: Integer = 100_000
+    aggressive_cleanup_batch_size: Integer = 50_000
+    monitor_content_types: Set<String> = {}
+}
+
+------------------------------------------------------------
+-- Rules: Tenant Resolution & Request Processing
+------------------------------------------------------------
+
+-- On every inbound request the system resolves the tenant from the
+-- request hostname. Only an active host on an active tenant proceeds
+-- to redirect evaluation. The matching pipeline (matching.allium)
+-- then considers only that tenant's enabled redirects.
+
+rule RedirectMatchFound {
+    when: RequestReceived(request)
+
+    let host = TenantHost{hostname: request.domain}
+
+    requires: exists host
+    requires: host.is_active
+
+    let tenant = host.tenant
+    let redirect = Matching.find_redirect(tenant, request)
+
+    requires: redirect != null
+
+    let target = Matching.resolve_target(redirect, request)
+
+    ensures: RedirectExecuted(
+        tenant: tenant,
+        request: request,
+        redirect: redirect,
+        target: target
+    )
+}
+
+rule NoRedirectMatchNotFound {
+    when: RequestReceived(request)
+
+    let host = TenantHost{hostname: request.domain}
+
+    requires: exists host
+    requires: host.is_active
+
+    let tenant = host.tenant
+
+    requires: Matching.find_redirect(tenant, request) = null
+    requires: request.response_code = 404
+
+    ensures: NotFoundDetected(tenant: tenant, request: request)
+}
+
+rule UnknownHostIgnored {
+    when: RequestReceived(request)
+
+    let host = TenantHost{hostname: request.domain}
+
+    requires: not exists host or not host.is_active
+
+    -- No tenant for this hostname; request passes through unhandled.
+    ensures: RequestIgnored(request: request)
+}
+
+------------------------------------------------------------
+-- Rules: Action Execution
+------------------------------------------------------------
+
+rule ExecuteRedirectAction {
+    when: RedirectExecuted(tenant, request, redirect, target)
+
+    requires: redirect.action_type = redirect
+
+    ensures: HttpRedirectIssued(
+        url: target,
+        code: redirect.action_code
+    )
+}
+
+rule ExecuteErrorAction {
+    when: RedirectExecuted(tenant, request, redirect, target)
+
+    requires: redirect.action_type = error
+
+    ensures: HttpErrorIssued(code: redirect.action_code)
+}
+
+-- Rewrite: serve content from a different internal path without changing
+-- the browser URL. No outbound HTTP request; handled at the routing layer.
+rule ExecuteRewriteAction {
+    when: RedirectExecuted(tenant, request, redirect, target)
+
+    requires: redirect.action_type = rewrite
+    requires: target != null
+
+    ensures: InternalRewriteIssued(
+        original_url: request.url,
+        target_url: target
+    )
+}
+
+rule ExecuteRandomAction {
+    when: RedirectExecuted(tenant, request, redirect, target)
+
+    requires: redirect.action_type = random
+    requires: redirect.random_targets.count > 0
+
+    let chosen = pick_random(redirect.random_targets)    -- black box
+
+    ensures: HttpRedirectIssued(
+        url: chosen,
+        code: redirect.action_code
+    )
+}
+
+-- The nothing action produces no HTTP response change.
+-- It exists solely for tracking and logging.
+rule ExecuteNothingAction {
+    when: RedirectExecuted(tenant, request, redirect, target)
+
+    requires: redirect.action_type = nothing
+
+    ensures: NothingActionRecorded(redirect: redirect)
+}
+
+------------------------------------------------------------
+-- Rules: Hit Tracking
+------------------------------------------------------------
+
+rule TrackHit {
+    when: RedirectExecuted(tenant, request, redirect, target)
+
+    requires: config.track_hits
+
+    ensures: redirect.hit_count = redirect.hit_count + 1
+    ensures: redirect.last_hit_at = now
+}
+
+------------------------------------------------------------
+-- Rules: Redirect Logging
+------------------------------------------------------------
+
+rule LogRedirect {
+    when: RedirectExecuted(tenant, request, redirect, target)
+
+    requires: not redirect.log_excluded
+
+    let captured_ip = capture_ip(request.client_ip, config.ip_logging)    -- black box
+    let captured_headers =
+        if config.log_request_headers: serialize_headers(request)    -- black box
+        else: null
+
+    ensures: RedirectLog.created(
+        tenant: tenant,
+        redirect: redirect,
+        created_at: now,
+        source_url: request.url,
+        target_url: target,
+        domain: request.domain,
+        ip: captured_ip,
+        http_code: redirect.action_code,
+        user_agent: request.user_agent,
+        referrer: request.referrer,
+        request_method: request.method,
+        request_headers: captured_headers,
+        redirect_source: "redirection"
+    )
+}
+
+rule LogNotFound {
+    when: NotFoundDetected(tenant, request)
+
+    let captured_ip = capture_ip(request.client_ip, config.ip_logging)    -- black box
+    let captured_headers =
+        if config.log_request_headers: serialize_headers(request)    -- black box
+        else: null
+
+    ensures: NotFoundLog.created(
+        tenant: tenant,
+        created_at: now,
+        url: request.url,
+        domain: request.domain,
+        ip: captured_ip,
+        user_agent: request.user_agent,
+        referrer: request.referrer,
+        request_method: request.method,
+        request_headers: captured_headers
+    )
+}
+
+------------------------------------------------------------
+-- Rules: Log Expiration
+------------------------------------------------------------
+
+-- Log cleanup runs globally across all tenants. Logs older than
+-- the configured retention are deleted in batches.
+
+rule ExpireRedirectLogs {
+    when: LogCleanupScheduled()
+
+    requires: config.redirect_log_retention_days > 0
+
+    let cutoff = now - config.redirect_log_retention_days.days
+    let expired = RedirectLogs where created_at < cutoff
+
+    requires: expired.count > 0
+
+    let batch_size =
+        if expired.count > config.aggressive_cleanup_threshold:
+            config.aggressive_cleanup_batch_size
+        else: config.log_cleanup_batch_size
+
+    ensures:
+        for log in take(expired, batch_size):    -- black box: first N items
+            not exists log
+
+    ensures:
+        if expired.count > batch_size:
+            LogCleanupScheduled()
+}
+
+rule ExpireNotFoundLogs {
+    when: LogCleanupScheduled()
+
+    requires: config.not_found_log_retention_days > 0
+
+    let cutoff = now - config.not_found_log_retention_days.days
+    let expired = NotFoundLogs where created_at < cutoff
+
+    requires: expired.count > 0
+
+    let batch_size =
+        if expired.count > config.aggressive_cleanup_threshold:
+            config.aggressive_cleanup_batch_size
+        else: config.log_cleanup_batch_size
+
+    ensures:
+        for log in take(expired, batch_size):    -- black box: first N items
+            not exists log
+
+    ensures:
+        if expired.count > batch_size:
+            LogCleanupScheduled()
+}
+
+------------------------------------------------------------
+-- Rules: Tenant Lifecycle
+------------------------------------------------------------
+
+rule CreateTenant {
+    when: CreateTenant(name)
+
+    ensures: Tenant.created(
+        name: name,
+        status: active
+    )
+}
+
+rule SuspendTenant {
+    when: SuspendTenant(tenant)
+
+    requires: tenant.status = active
+
+    ensures: tenant.status = suspended
+}
+
+rule ActivateTenant {
+    when: ActivateTenant(tenant)
+
+    requires: tenant.status = suspended
+
+    ensures: tenant.status = active
+}
+
+rule AddTenantHost {
+    when: AddTenantHost(tenant, hostname, environment?)
+
+    requires: tenant.is_active
+    requires: not exists TenantHost{hostname: hostname}
+
+    ensures: TenantHost.created(
+        tenant: tenant,
+        hostname: hostname,
+        environment: environment,
+        status: enabled
+    )
+}
+
+rule RemoveTenantHost {
+    when: RemoveTenantHost(host)
+
+    requires: host.tenant.active_hosts.count > 1
+
+    ensures: not exists host
+}
+
+rule EnableTenantHost {
+    when: EnableTenantHost(host)
+
+    requires: host.status = disabled
+
+    ensures: host.status = enabled
+}
+
+rule DisableTenantHost {
+    when: DisableTenantHost(host)
+
+    requires: host.status = enabled
+
+    ensures: host.status = disabled
+}
+
+------------------------------------------------------------
+-- Rules: Group Lifecycle
+------------------------------------------------------------
+
+rule CreateGroup {
+    when: CreateGroup(tenant, name)
+
+    requires: tenant.is_active
+
+    ensures: Group.created(
+        tenant: tenant,
+        name: name,
+        status: enabled,
+        position: tenant.groups.count
+    )
+}
+
+rule EnableGroup {
+    when: EnableGroup(group)
+
+    requires: group.status = disabled
+
+    ensures: group.status = enabled
+    ensures:
+        for r in group.redirects:
+            r.status = enabled
+}
+
+rule DisableGroup {
+    when: DisableGroup(group)
+
+    requires: group.status = enabled
+
+    ensures: group.status = disabled
+    ensures:
+        for r in group.redirects:
+            r.status = disabled
+}
+
+rule DeleteGroup {
+    when: DeleteGroup(group)
+
+    -- Cascade: remove all contained redirects
+    ensures:
+        for r in group.redirects:
+            not exists r
+    ensures: not exists group
+}
+
+------------------------------------------------------------
+-- Rules: Redirect Lifecycle
+------------------------------------------------------------
+
+rule CreateRedirect {
+    when: CreateRedirect(group, source_url, source_flags, match_type,
+                         target_url?, alternate_target_url?, action_type,
+                         action_code, title?, match_value?, match_is_regex?,
+                         random_targets?, log_excluded?)
+
+    ensures: Redirect.created(
+        group: group,
+        position: group.redirects.count,
+        source_url: source_url,
+        source_flags: source_flags,
+        match_type: match_type,
+        match_value: match_value,
+        match_is_regex: match_is_regex ?? false,
+        target_url: target_url,
+        alternate_target_url: alternate_target_url,
+        action_type: action_type,
+        action_code: action_code,
+        random_targets: random_targets ?? [],
+        title: title,
+        status: enabled,
+        hit_count: 0,
+        log_excluded: log_excluded ?? false
+    )
+}
+
+rule UpdateRedirect {
+    when: UpdateRedirect(redirect, source_url?, source_flags?, match_type?,
+                         target_url?, alternate_target_url?, action_type?,
+                         action_code?, group?, title?, match_value?,
+                         match_is_regex?, random_targets?, log_excluded?)
+
+    ensures: redirect.source_url = source_url ?? redirect.source_url
+    ensures: redirect.source_flags = source_flags ?? redirect.source_flags
+    ensures: redirect.match_type = match_type ?? redirect.match_type
+    ensures: redirect.match_value = match_value ?? redirect.match_value
+    ensures: redirect.match_is_regex = match_is_regex ?? redirect.match_is_regex
+    ensures: redirect.target_url = target_url ?? redirect.target_url
+    ensures: redirect.alternate_target_url = alternate_target_url ?? redirect.alternate_target_url
+    ensures: redirect.action_type = action_type ?? redirect.action_type
+    ensures: redirect.action_code = action_code ?? redirect.action_code
+    ensures: redirect.group = group ?? redirect.group
+    ensures: redirect.title = title ?? redirect.title
+    ensures: redirect.random_targets = random_targets ?? redirect.random_targets
+    ensures: redirect.log_excluded = log_excluded ?? redirect.log_excluded
+}
+
+rule EnableRedirect {
+    when: EnableRedirect(redirect)
+
+    requires: redirect.status = disabled
+
+    ensures: redirect.status = enabled
+}
+
+rule DisableRedirect {
+    when: DisableRedirect(redirect)
+
+    requires: redirect.status = enabled
+
+    ensures: redirect.status = disabled
+}
+
+rule DeleteRedirect {
+    when: DeleteRedirect(redirect)
+
+    ensures: not exists redirect
+}
+
+rule ResetRedirectHits {
+    when: ResetRedirectHits(redirect)
+
+    ensures: redirect.hit_count = 0
+    ensures: redirect.last_hit_at = null
+}
+
+------------------------------------------------------------
+-- Rules: Content URL Monitoring
+------------------------------------------------------------
+
+-- When a content item's public URL changes, automatically create
+-- a redirect from the old URL to the new one within the content
+-- item's tenant.
+
+rule ContentUrlChanged {
+    when: ContentUrlChanged(tenant, item, monitor)
+
+    requires: item.previous_url != null
+    requires: item.previous_url != item.current_url
+    requires: item.content_type in config.monitor_content_types
+
+    ensures: Redirect.created(
+        group: monitor.target_group,
+        position: monitor.target_group.redirects.count,
+        source_url: item.previous_url,
+        source_flags: SourceFlags {
+            case_insensitive: false,
+            ignore_trailing_slash: false,
+            query_handling: exact,
+            is_regex: false
+        },
+        match_type: url,
+        target_url: item.current_url,
+        action_type: redirect,
+        action_code: 301,
+        random_targets: [],
+        status: enabled,
+        hit_count: 0,
+        match_is_regex: false,
+        log_excluded: false
+    )
+}
+
+------------------------------------------------------------
+-- Rules: Bulk Operations
+------------------------------------------------------------
+
+rule BulkDeleteRedirects {
+    when: BulkDeleteRedirects(redirects)
+
+    ensures:
+        for r in redirects:
+            not exists r
+}
+
+rule BulkSetRedirectStatus {
+    when: BulkSetRedirectStatus(redirects, new_status)
+
+    ensures:
+        for r in redirects:
+            r.status = new_status
+}
+
+rule BulkDeleteRedirectLogs {
+    when: BulkDeleteRedirectLogs(logs)
+
+    ensures:
+        for log in logs:
+            not exists log
+}
+
+rule BulkDeleteNotFoundLogs {
+    when: BulkDeleteNotFoundLogs(logs)
+
+    ensures:
+        for log in logs:
+            not exists log
+}
+
+rule DeleteAllTenantRedirectLogs {
+    when: DeleteAllTenantRedirectLogs(tenant)
+
+    ensures:
+        for log in RedirectLogs where tenant = tenant:
+            not exists log
+}
+
+rule DeleteAllTenantNotFoundLogs {
+    when: DeleteAllTenantNotFoundLogs(tenant)
+
+    ensures:
+        for log in NotFoundLogs where tenant = tenant:
+            not exists log
+}
+
+------------------------------------------------------------
+-- Rules: Import
+------------------------------------------------------------
+
+rule ImportRedirects {
+    when: ImportRedirects(source_data, format, target_group)
+
+    let records = parse_import(source_data, format)    -- black box
+
+    ensures:
+        for record in records:
+            Redirect.created(
+                group: target_group,
+                position: target_group.redirects.count,
+                source_url: record.source_url,
+                source_flags: record.source_flags,
+                match_type: record.match_type,
+                match_value: record.match_value,
+                match_is_regex: record.match_is_regex,
+                target_url: record.target_url,
+                alternate_target_url: record.alternate_target_url,
+                action_type: record.action_type,
+                action_code: record.action_code,
+                random_targets: record.random_targets,
+                title: record.title,
+                status: enabled,
+                hit_count: 0,
+                log_excluded: false
+            )
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor TenantAdmin {
+    within: Tenant
+    identified_by: User where is_admin
+}
+
+actor SystemAdmin {
+    identified_by: User where is_admin
+}
+
+------------------------------------------------------------
+-- Surfaces: System Administration
+------------------------------------------------------------
+
+surface TenantManagement {
+    facing admin: SystemAdmin
+
+    let tenants = Tenants
+
+    exposes:
+        for tenant in tenants:
+            tenant.name
+            tenant.status
+            tenant.active_hosts
+            tenant.groups.count
+
+    provides:
+        CreateTenant(name)
+        for tenant in tenants:
+            SuspendTenant(tenant)
+                when tenant.status = active
+            ActivateTenant(tenant)
+                when tenant.status = suspended
+
+    related:
+        for tenant in tenants:
+            TenantHostManagement(tenant)
+            TenantRedirectManagement(tenant)
+}
+
+surface TenantHostManagement {
+    facing admin: SystemAdmin
+
+    context tenant: Tenant
+
+    exposes:
+        tenant.name
+        for host in tenant.hosts:
+            host.hostname
+            host.environment
+            host.status
+
+    provides:
+        AddTenantHost(tenant, hostname, environment?)
+        for host in tenant.hosts:
+            EnableTenantHost(host)
+                when host.status = disabled
+            DisableTenantHost(host)
+                when host.status = enabled
+            RemoveTenantHost(host)
+                when tenant.active_hosts.count > 1
+}
+
+------------------------------------------------------------
+-- Surfaces: Tenant-Scoped Redirect Administration
+------------------------------------------------------------
+
+surface TenantRedirectManagement {
+    facing admin: TenantAdmin
+
+    context tenant: Tenant
+
+    exposes:
+        tenant.name
+        for group in tenant.groups:
+            group.name
+            group.status
+            group.position
+            group.redirects.count
+
+    provides:
+        CreateGroup(tenant, name)
+        for group in tenant.groups:
+            EnableGroup(group)
+                when group.status = disabled
+            DisableGroup(group)
+                when group.status = enabled
+            DeleteGroup(group)
+
+    related:
+        for group in tenant.groups:
+            GroupDetail(group)
+        TenantRedirectLogs(tenant)
+        TenantNotFoundLogs(tenant)
+        TenantImportExport(tenant)
+        TenantSettings(tenant)
+}
+
+surface GroupDetail {
+    facing admin: TenantAdmin
+
+    context group: Group
+
+    exposes:
+        group.name
+        group.status
+        for redirect in group.redirects:
+            redirect.source_url
+            redirect.target_url
+            redirect.action_type
+            redirect.action_code
+            redirect.match_type
+            redirect.status
+            redirect.hit_count
+            redirect.last_hit_at
+            redirect.title
+
+    provides:
+        CreateRedirect(group, source_url, source_flags, match_type,
+                       target_url?, alternate_target_url?, action_type,
+                       action_code, title?, match_value?, match_is_regex?,
+                       random_targets?, log_excluded?)
+        for redirect in group.redirects:
+            UpdateRedirect(redirect)
+            EnableRedirect(redirect)
+                when redirect.status = disabled
+            DisableRedirect(redirect)
+                when redirect.status = enabled
+            DeleteRedirect(redirect)
+            ResetRedirectHits(redirect)
+        BulkDeleteRedirects(redirects)
+        BulkSetRedirectStatus(redirects, new_status)
+
+    related:
+        for redirect in group.redirects:
+            RedirectDetail(redirect)
+}
+
+surface RedirectDetail {
+    facing admin: TenantAdmin
+
+    context redirect: Redirect
+
+    exposes:
+        redirect.source_url
+        redirect.source_flags
+        redirect.match_type
+        redirect.match_value
+        redirect.match_is_regex
+        redirect.target_url
+        redirect.alternate_target_url
+        redirect.action_type
+        redirect.action_code
+        redirect.random_targets
+        redirect.title
+        redirect.status
+        redirect.hit_count
+        redirect.last_hit_at
+        redirect.log_excluded
+        redirect.group
+
+    provides:
+        UpdateRedirect(redirect, source_url?, source_flags?, match_type?,
+                       target_url?, alternate_target_url?, action_type?,
+                       action_code?, group?, title?, match_value?,
+                       match_is_regex?, random_targets?, log_excluded?)
+        EnableRedirect(redirect)
+            when redirect.status = disabled
+        DisableRedirect(redirect)
+            when redirect.status = enabled
+        DeleteRedirect(redirect)
+        ResetRedirectHits(redirect)
+
+    related:
+        RedirectLogView(redirect)
+}
+
+surface RedirectLogView {
+    facing admin: TenantAdmin
+
+    context redirect: Redirect
+
+    exposes:
+        for log in redirect.logs:
+            log.created_at
+            log.source_url
+            log.target_url
+            log.ip
+            log.http_code
+            log.user_agent
+            log.referrer
+            log.request_method
+
+    provides:
+        BulkDeleteRedirectLogs(logs)
+}
+
+surface TenantRedirectLogs {
+    facing admin: TenantAdmin
+
+    context tenant: Tenant
+
+    let logs = RedirectLogs where tenant = tenant
+
+    exposes:
+        for log in logs:
+            log.created_at
+            log.source_url
+            log.target_url
+            log.domain
+            log.ip
+            log.http_code
+            log.user_agent
+            log.referrer
+            log.request_method
+            log.redirect_source
+
+    provides:
+        BulkDeleteRedirectLogs(logs)
+        DeleteAllTenantRedirectLogs(tenant)
+
+    guidance:
+        -- Support filtering by IP, URL, domain, referrer, user agent,
+        -- HTTP code, request method, target URL, and redirect source.
+        -- Support grouping by IP, URL, or user agent for analytics.
+        -- Support CSV export of filtered results.
+}
+
+surface TenantNotFoundLogs {
+    facing admin: TenantAdmin
+
+    context tenant: Tenant
+
+    let logs = NotFoundLogs where tenant = tenant
+
+    exposes:
+        for log in logs:
+            log.created_at
+            log.url
+            log.domain
+            log.ip
+            log.user_agent
+            log.referrer
+            log.request_method
+
+    provides:
+        BulkDeleteNotFoundLogs(logs)
+        DeleteAllTenantNotFoundLogs(tenant)
+
+    guidance:
+        -- Support filtering by IP, URL, domain, referrer, user agent,
+        -- and request method.
+        -- Support grouping by IP, URL, or user agent for analytics.
+        -- Suggest redirect creation from frequent 404 URLs.
+        -- Support CSV export of filtered results.
+}
+
+surface TenantImportExport {
+    facing admin: TenantAdmin
+
+    context tenant: Tenant
+
+    provides:
+        ImportRedirects(source_data, format, target_group)
+
+    guidance:
+        -- target_group must belong to this tenant.
+        -- Supported import formats: JSON, CSV, Apache .htaccess, Nginx config.
+        -- Export formats: JSON, CSV, Apache .htaccess, Nginx config.
+}
+
+surface TenantSettings {
+    facing admin: TenantAdmin
+
+    context tenant: Tenant
+
+    exposes:
+        config.redirect_log_retention_days
+        config.not_found_log_retention_days
+        config.track_hits
+        config.log_request_headers
+        config.ip_logging
+        config.monitor_content_types
+
+    provides:
+        UpdateSettings(redirect_log_retention_days?, not_found_log_retention_days?,
+                       track_hits?, log_request_headers?, ip_logging?,
+                       monitor_content_types?)
+
+    guidance:
+        -- Show current log counts for this tenant.
+        -- Warn when log retention is 0 (keep forever) and log tables are large.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred Matching.find_redirect      -- see: matching.allium
+deferred Matching.resolve_target     -- see: matching.allium
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "What import formats should be supported beyond JSON/CSV/Apache/Nginx? The original system supports importing from 7+ competing redirect plugins."
