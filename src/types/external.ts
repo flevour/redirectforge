@@ -2,8 +2,8 @@ export interface HttpRequest {
   url: string;
   method: string;
   domain: string;
-  ip: string;
-  client_ip: string;
+  ip?: string;
+  client_ip?: string;
   user_agent?: string;
   referrer?: string;
   accept_language?: string;

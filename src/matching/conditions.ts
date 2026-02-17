@@ -13,7 +13,7 @@ function containsInsensitive(haystack: string, needle: string): boolean {
 
 function evaluateIp(redirect: Redirect, request: HttpRequest): boolean {
   const ipList = parseIpList(redirect.match_value);
-  return ipInList(request.client_ip, ipList);
+  return request.client_ip ? ipInList(request.client_ip, ipList) : false;
 }
 
 function evaluateUserAgent(redirect: Redirect, request: HttpRequest): boolean {
