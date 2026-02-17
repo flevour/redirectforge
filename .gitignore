@@ -1,5 +1,5 @@
 node_modules/
-dist/
+# dist/ is committed so GitHub installs work without devDependencies
 *.tsbuildinfo
 .DS_Store
 .claude/settings.local.json
