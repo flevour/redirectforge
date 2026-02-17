@@ -11,11 +11,25 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./postgres": {
+      "types": "./dist/postgres.d.ts",
+      "import": "./dist/postgres.js",
+      "require": "./dist/postgres.cjs"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "migrations"
   ],
+  "peerDependencies": {
+    "pg": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
@@ -38,9 +52,11 @@
   "license": "MIT",
   "packageManager": "pnpm@10.22.0",
   "devDependencies": {
+    "@types/pg": "^8.16.0",
     "@typescript-eslint/eslint-plugin": "^8.55.0",
     "@typescript-eslint/parser": "^8.55.0",
     "eslint": "^10.0.0",
+    "pg": "^8.18.0",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
